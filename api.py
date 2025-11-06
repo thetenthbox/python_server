@@ -531,11 +531,14 @@ async def get_dashboard(
                 }
                 break
         
+        # Check if node is busy (has running job)
+        is_busy = current_job is not None
+        
         queue_info.append({
             'node_id': node_id,
             'queue_size': queue_size,
             'queue_time_seconds': queue_time,
-            'is_busy': node_stats[node_id]['is_busy'],
+            'is_busy': is_busy,
             'current_job': current_job
         })
     
@@ -583,11 +586,11 @@ async def get_dashboard(
     
     # System health metrics
     total_nodes = 8
-    busy_nodes = sum(1 for n in node_stats if n['is_busy'])
+    busy_nodes = sum(1 for q in queue_info if q['is_busy'])
     utilization = (busy_nodes / total_nodes) * 100
     
     # Average queue time across all nodes
-    avg_queue_time = sum(q['queue_time_seconds'] for q in queue_info) / len(queue_info)
+    avg_queue_time = sum(q['queue_time_seconds'] for q in queue_info) / len(queue_info) if queue_info else 0
     
     # Success rate (last 100 jobs)
     recent_completed = db.query(models.Job).filter(
