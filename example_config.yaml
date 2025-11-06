@@ -1,0 +1,9 @@
+# Example job configuration file
+# This file should be uploaded along with your Python script
+
+competition_id: "comp123"
+project_id: "proj456"
+user_id: "user123"
+expected_time: 300  # Expected runtime in seconds
+token: "my-secret-token-abc123"  # Your authentication token
+
