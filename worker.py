@@ -25,6 +25,12 @@ class Worker(threading.Thread):
         print(f"Worker for node {self.node_id} started")
         
         while self.running:
+            # Check if node is already busy before getting next job
+            if self.is_node_busy():
+                # Node is busy, wait before checking again
+                time.sleep(config.WORKER_POLL_INTERVAL)
+                continue
+            
             # Get next job from queue
             job_id = queue_manager.get_next_job(self.node_id)
             
@@ -34,11 +40,52 @@ class Worker(threading.Thread):
                 # No jobs, sleep briefly
                 time.sleep(config.WORKER_POLL_INTERVAL)
     
+    def is_node_busy(self) -> bool:
+        """Check if node is currently busy processing a job"""
+        db = next(models.get_db())
+        try:
+            node_state = db.query(models.NodeState).filter(
+                models.NodeState.node_id == self.node_id
+            ).first()
+            if node_state and node_state.is_busy:
+                # Double-check: verify the job is actually still running
+                if node_state.current_job_id:
+                    job = db.query(models.Job).filter(
+                        models.Job.job_id == node_state.current_job_id
+                    ).first()
+                    if job and job.status == "running":
+                        return True
+                    else:
+                        # Job is not running, but node state says busy - fix it
+                        node_state.is_busy = False
+                        node_state.current_job_id = None
+                        db.commit()
+                        return False
+                else:
+                    # is_busy is True but no current_job_id - fix it
+                    node_state.is_busy = False
+                    db.commit()
+                    return False
+            return False
+        finally:
+            db.close()
+    
     def process_job(self, job_id: str):
         """Process a single job"""
         db = next(models.get_db())
         
         try:
+            # Double-check: ensure node is not already busy (race condition protection)
+            node_state = db.query(models.NodeState).filter(
+                models.NodeState.node_id == self.node_id
+            ).first()
+            if node_state and node_state.is_busy:
+                # Node is busy, put job back in queue and return
+                print(f"Node {self.node_id} is already busy, re-queuing job {job_id}")
+                with queue_manager.lock:
+                    queue_manager.node_queues[self.node_id].appendleft(job_id)
+                return
+            
             # Get job from database
             job = db.query(models.Job).filter(models.Job.job_id == job_id).first()
             if not job:
@@ -51,11 +98,19 @@ class Worker(threading.Thread):
             job.started_at = datetime.utcnow()
             db.commit()
             
-            # Update node state
-            node_state = db.query(models.NodeState).filter(
-                models.NodeState.node_id == self.node_id
-            ).first()
+            # Update node state (atomic: check and set)
             if node_state:
+                # Final check: ensure we can claim this node
+                db.refresh(node_state)
+                if node_state.is_busy:
+                    # Another process claimed it, put job back
+                    print(f"Node {self.node_id} was claimed by another process, re-queuing job {job_id}")
+                    job.status = "pending"
+                    db.commit()
+                    with queue_manager.lock:
+                        queue_manager.node_queues[self.node_id].appendleft(job_id)
+                    return
+                
                 node_state.is_busy = True
                 node_state.current_job_id = job_id
                 db.commit()
