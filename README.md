@@ -113,6 +113,8 @@ python3 token_manager.py create admin admin_token --admin
 - **⚡ Rate Limiting** - 5 submissions/min per user
 - **📊 Queue Management** - Intelligent load balancing across 8 GPU nodes
 - **🔄 Job Control** - Submit, monitor, and cancel jobs
+- **⏱️ Flexible Execution** - Sync mode (< 4 hours) or async mode (multi-day jobs)
+- **🛡️ Fault Tolerance** - Jobs continue running even after API timeout
 - **📝 Results Storage** - Automatic local storage with naming `{user}_{comp}_{time}.jsonl`
 - **🛡️ Security** - Token expiration (30 days), one token per user
 
@@ -348,6 +350,6 @@ python_server/
 
 ---
 
-**Version:** 2.0 (with access control)  
-**Last Updated:** 2025-11-06
+**Version:** 2.1 (with async/sync mode for multi-day jobs)  
+**Last Updated:** 2025-11-09
 

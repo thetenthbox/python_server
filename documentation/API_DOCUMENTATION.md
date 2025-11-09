@@ -31,15 +31,26 @@ Default credentials:
 
 ## 📡 Endpoints
 
-### 1. Submit Job (Synchronous)
+### 1. Submit Job
 
-**POST** `/api/submit`
+**POST** `/api/submit?wait=true|false`
 
-Submit a solution for grading and wait for completion. Returns full grading results when job finishes.
+Submit a solution for grading.
+
+**Query Parameters:**
+- `wait` (boolean, optional, default: `true`)
+  - `true`: Wait for job completion (up to 4 hours) and return results
+  - `false`: Return immediately with job_id (for multi-day jobs)
 
 **Request:**
 ```bash
-curl -X POST http://localhost:8001/api/submit \
+# Synchronous mode (wait for completion, < 4 hours)
+curl -X POST "http://localhost:8001/api/submit?wait=true" \
+  -F "code=@your_solution.py" \
+  -F "config_file=@config.yaml"
+
+# Asynchronous mode (submit and return immediately)
+curl -X POST "http://localhost:8001/api/submit?wait=false" \
   -F "code=@your_solution.py" \
   -F "config_file=@config.yaml"
 ```
@@ -53,7 +64,7 @@ expected_time: 60  # estimated seconds
 token: "sarang"
 ```
 
-**Response (on completion):**
+**Response (wait=true, on completion):**
 ```json
 {
   "job_id": "uuid",
@@ -64,6 +75,27 @@ token: "sarang"
   "exit_code": 0,
   "started_at": "2025-11-06T15:42:50.997341",
   "completed_at": "2025-11-06T15:43:47.114873"
+}
+```
+
+**Response (wait=false, immediate):**
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "node_id": 3,
+  "status": "pending",
+  "message": "Job submitted successfully. Use /api/status/{job_id} to check progress.",
+  "created_at": "2025-11-09T12:00:00"
+}
+```
+
+**Response (wait=true, on timeout - 4 hours max):**
+```json
+{
+  "job_id": "uuid",
+  "node_id": 0,
+  "status": "running",
+  "message": "Timeout after 14400s. Job still running. Use /api/results/{job_id} to check later."
 }
 ```
 
@@ -80,19 +112,10 @@ jobs/results/{user_id}_{competition_id}_{YYYYMMDD_HHMMSS}.jsonl
 ```
 Example: `jobs/results/sarang_random-acts-of-pizza_20251106_154517.jsonl`
 
-**Response (on timeout - 300s max):**
-```json
-{
-  "job_id": "uuid",
-  "node_id": 0,
-  "status": "running",
-  "message": "Timeout after 300s. Job still running. Use /api/results/{job_id} to check later."
-}
-```
-
 **Notes:**
-- Waits up to 5 minutes (300s) for job completion
-- Returns immediately with results when job finishes
+- **Synchronous mode (`wait=true`)**: Waits up to 4 hours for job completion. Use for jobs under 4 hours.
+- **Asynchronous mode (`wait=false`)**: Returns immediately with job_id. Use for multi-day training jobs.
+- Jobs continue running even after API timeout (protected by `setsid nohup`)
 - Solution file is uploaded to GPU node as `solution.py`
 - Grading command executed: `cd /home/gpuuser/aira-dojo && python src/dojo/grade_code.py solution.py {competition_id} results.jsonl`
 - Parse the `stdout` field (it's a JSON string) to access grading details
@@ -298,7 +321,44 @@ print(f\"Gold medal: {results['grading_report']['gold_medal']}\")
 "
 ```
 
-### Example 2: Check GPU Availability
+### Example 2: Submit Multi-Day Training Job (Async Mode)
+
+```bash
+# Submit long-running job without waiting
+curl -s -X POST "http://localhost:8001/api/submit?wait=false" \
+  -F "code=@long_training.py" \
+  -F "config_file=@config.yaml" | tee response.json
+
+# Extract job ID
+JOB_ID=$(cat response.json | jq -r '.job_id')
+echo "Job ID: $JOB_ID"
+
+# Check status periodically (job continues running)
+while true; do
+  STATUS=$(curl -s -H "Authorization: Bearer YOUR_TOKEN" \
+    "http://localhost:8001/api/status/$JOB_ID" | jq -r '.status')
+  echo "[$(date)] Status: $STATUS"
+  
+  [[ "$STATUS" == "completed" || "$STATUS" == "failed" ]] && break
+  
+  sleep 300  # Check every 5 minutes
+done
+
+# Get results when complete
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8001/api/results/$JOB_ID" > final_results.json
+
+python3 << 'EOF'
+import json
+with open('final_results.json') as f:
+    result = json.load(f)
+    grading = json.loads(result['stdout'])
+    print(f"Final Score: {grading['test_fitness']}")
+    print(f"Execution time: {grading['exec_time']}s")
+EOF
+```
+
+### Example 3: Check GPU Availability
 
 ```bash
 # Check which nodes are available
@@ -363,16 +423,18 @@ else:
 
 ## ⚠️ Important Notes
 
-1. **Timeout**: Submit endpoint waits max 300 seconds (5 minutes). For longer jobs, use status/results endpoints.
-2. **GPU Access**: Solutions run on H100 GPUs with CUDA 12.4 in sandboxed Apptainer environment.
-3. **Grading Environment**: Your code runs in `/home/gpuuser/aira-dojo` with access to competition datasets.
-4. **Competition ID**: Must be a valid competition identifier (e.g., "random-acts-of-pizza").
-5. **Output Format**: Your solution must generate a `submission.csv` file - this is what gets graded.
-6. **Results Storage**: All grading results are saved as `{user_id}_{competition_id}_{timestamp}.jsonl` on the server.
-7. **Parsing Results**: The `stdout` field contains a JSON string - parse it with `json.loads()` to access grading details.
-8. **Authentication**: Keep your token secure; anyone with it can submit jobs under your user_id.
-9. **Queue**: Jobs are assigned to nodes with shortest queue automatically.
-10. **Execution**: The grading system runs your code, evaluates output, and returns detailed metrics.
+1. **Timeout**: Submit endpoint with `wait=true` waits max 14400 seconds (4 hours). For multi-day jobs, use `wait=false`.
+2. **Multi-Day Jobs**: Jobs continue running even after API timeout thanks to `setsid nohup` protection.
+3. **GPU Access**: Solutions run on H100 GPUs with CUDA 12.4 in sandboxed Apptainer environment.
+4. **Grading Environment**: Your code runs in `/home/gpuuser/aira-dojo` with access to competition datasets.
+5. **Competition ID**: Must be a valid competition identifier (e.g., "random-acts-of-pizza").
+6. **Output Format**: Your solution must generate a `submission.csv` file - this is what gets graded.
+7. **Results Storage**: All grading results are saved as `{user_id}_{competition_id}_{timestamp}.jsonl` on the server.
+8. **Parsing Results**: The `stdout` field contains a JSON string - parse it with `json.loads()` to access grading details.
+9. **Authentication**: Keep your token secure; anyone with it can submit jobs under your user_id.
+10. **Queue**: Jobs are assigned to nodes with shortest queue automatically.
+11. **Execution**: The grading system runs your code, evaluates output, and returns detailed metrics.
+12. **Async Mode**: For jobs that might take days, use `wait=false` and poll with `/api/status/{job_id}`.
 
 ---
 
