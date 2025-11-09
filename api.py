@@ -37,18 +37,25 @@ async def submit_job(
     request: Request,
     code: UploadFile = File(...),
     config_file: UploadFile = File(...),
+    wait: bool = True,
     db: Session = Depends(get_db)
 ):
     """
-    Submit a new job and wait for completion
+    Submit a new job
     Files:
         - code: .py file with Python code
         - config_file: .yaml file with job configuration
     
-    Returns results directly after job completes
+    Query parameters:
+        - wait: If True (default), wait for job completion (up to 4 hours)
+                If False, return immediately with job_id (use for multi-day jobs)
+    
+    Returns:
+        - If wait=True: results directly after job completes (or timeout)
+        - If wait=False: job_id immediately, poll with /api/status/{job_id}
     
     Rate limits: 5 submissions per minute per user
-    Queue limit: 1 job per user at a time
+    Queue limit: 5 jobs per user at a time
     """
     try:
         # General endpoint protection (100 requests/min per IP)
@@ -66,6 +73,9 @@ async def submit_job(
         for field in required_fields:
             if field not in job_config:
                 raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+        
+        # Optional: local_results_path for downloading results to user's machine
+        local_results_path = job_config.get('local_results_path', None)
         
         # Validate token
         token_result = auth.validate_token(job_config['token'], db)
@@ -114,10 +124,10 @@ async def submit_job(
             models.Job.status.in_(['pending', 'running'])
         ).count()
         
-        if existing_jobs >= 1:
+        if existing_jobs >= 5:
             raise HTTPException(
                 status_code=429, 
-                detail=f"Queue limit exceeded. You already have {existing_jobs} job(s) in progress. Maximum 1 job per user allowed."
+                detail=f"Queue limit exceeded. You already have {existing_jobs} job(s) in progress. Maximum 5 jobs per user allowed."
             )
         
         # Generate job ID
@@ -161,14 +171,74 @@ async def submit_job(
         new_job.node_id = node_id
         db.commit()
         
-        # Wait for job completion (max 5 minutes)
-        timeout = 300
+        # If async mode (wait=False), return immediately
+        if not wait:
+            return {
+                "job_id": job_id,
+                "node_id": node_id,
+                "status": "pending",
+                "message": "Job submitted successfully. Use /api/status/{job_id} to check progress.",
+                "created_at": new_job.created_at
+            }
+        
+        # Wait for job completion (max 4 hours for long-running ML jobs)
+        timeout = 14400  # 4 hours
         start_time = asyncio.get_event_loop().time()
         
         while True:
             db.refresh(new_job)
             
             if new_job.status in ["completed", "failed", "cancelled"]:
+                # If local_results_path is specified, save results.jsonl there
+                if local_results_path and new_job.status == "completed" and new_job.stdout:
+                    try:
+                        # Parse the results.jsonl from stdout
+                        results_content = new_job.stdout
+                        
+                        # Expand user path (handles ~)
+                        output_dir = os.path.expanduser(local_results_path)
+                        
+                        # Create directory if it doesn't exist
+                        os.makedirs(output_dir, exist_ok=True)
+                        
+                        # Generate filename
+                        from datetime import datetime
+                        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                        filename = f"{new_job.user_id}_{new_job.competition_id}_{timestamp}.jsonl"
+                        output_path = os.path.join(output_dir, filename)
+                        
+                        # Save results to local path
+                        with open(output_path, 'w') as f:
+                            f.write(results_content)
+                        
+                        # Return with local_results_saved flag
+                        return {
+                            "job_id": job_id,
+                            "node_id": node_id,
+                            "status": new_job.status,
+                            "stdout": new_job.stdout,
+                            "stderr": new_job.stderr,
+                            "exit_code": new_job.exit_code,
+                            "started_at": new_job.started_at,
+                            "completed_at": new_job.completed_at,
+                            "local_results_saved": True,
+                            "local_results_path": output_path
+                        }
+                    except Exception as e:
+                        # If saving locally fails, still return the results but with error flag
+                        return {
+                            "job_id": job_id,
+                            "node_id": node_id,
+                            "status": new_job.status,
+                            "stdout": new_job.stdout,
+                            "stderr": new_job.stderr,
+                            "exit_code": new_job.exit_code,
+                            "started_at": new_job.started_at,
+                            "completed_at": new_job.completed_at,
+                            "local_results_saved": False,
+                            "local_results_error": str(e)
+                        }
+                
                 return {
                     "job_id": job_id,
                     "node_id": node_id,
